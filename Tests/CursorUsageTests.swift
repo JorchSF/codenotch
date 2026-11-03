@@ -369,3 +369,135 @@ final class CursorEnterpriseUsageTests: XCTestCase {
         XCTAssertEqual(CursorUsage.headlineID(in: windows), "included")
     }
 }
+
+/// The provider tries the editor's session, then `cursor-agent`'s. The agent is
+/// reached when the editor is signed out *and* when the endpoint rejects the
+/// editor's token — a signed-in editor whose token 401s used to hide Cursor.
+final class CursorLocalProviderTests: XCTestCase {
+    private let summary = """
+    {"billingCycleStart":"2026-10-01T00:00:00.000Z","billingCycleEnd":"2026-11-01T00:00:00.000Z",
+     "membershipType":"pro","individualUsage":{"plan":{"enabled":true,"used":0,"limit":0,"remaining":0,
+     "breakdown":{"included":0,"bonus":0,"total":0},"autoPercentUsed":0,"apiPercentUsed":40,"totalPercentUsed":20},
+     "onDemand":{"enabled":false,"used":0,"limit":null,"remaining":null}},"teamUsage":{}}
+    """
+
+    private let editor = CursorCredentials(accountID: "auth0|user_EDITOR", accessToken: "editor-tok")
+    private let agent = CursorCredentials(accountID: "auth0|user_CLI", accessToken: "cli-tok")
+
+    override func setUp() { CursorEndpoint.reset() }
+
+    private func provider(editor: @escaping @Sendable () throws -> CursorCredentials,
+                          agent: @escaping @Sendable () throws -> CursorCredentials) -> CursorLocalProvider {
+        CursorLocalProvider(session: CursorEndpoint.session(),
+                            editorCredentials: editor, agentCredentials: agent)
+    }
+
+    func testASignedInEditorIsUsedWithoutTouchingTheAgent() async throws {
+        CursorEndpoint.answers = [.init(status: 200, body: Data(summary.utf8))]
+        let editor = self.editor
+        let snap = try await provider(editor: { editor },
+                                      agent: { XCTFail("agent read"); throw UsageProviderError.needsAuth })
+            .fetchSnapshot()
+        XCTAssertEqual(snap.status, .ok)
+        XCTAssertEqual(snap.plan, "pro")
+        XCTAssertEqual(CursorEndpoint.cookies, [editor.sessionCookie])
+    }
+
+    func testARejectedEditorTokenFallsThroughToTheAgent() async throws {
+        CursorEndpoint.answers = [.init(status: 401), .init(status: 200, body: Data(summary.utf8))]
+        let (editor, agent) = (self.editor, self.agent)
+        let snap = try await provider(editor: { editor }, agent: { agent }).fetchSnapshot()
+        XCTAssertEqual(snap.status, .ok)
+        XCTAssertFalse(snap.windows.isEmpty)
+        XCTAssertEqual(CursorEndpoint.cookies, [editor.sessionCookie, agent.sessionCookie])
+    }
+
+    func testASignedOutEditorFallsThroughToTheAgent() async throws {
+        CursorEndpoint.answers = [.init(status: 200, body: Data(summary.utf8))]
+        let agent = self.agent
+        _ = try await provider(editor: { throw UsageProviderError.needsAuth }, agent: { agent })
+            .fetchSnapshot()
+        XCTAssertEqual(CursorEndpoint.cookies, [agent.sessionCookie])
+    }
+
+    func testBothRejectedIsSignedOut() async {
+        CursorEndpoint.answers = [.init(status: 401), .init(status: 403)]
+        let (editor, agent) = (self.editor, self.agent)
+        do {
+            _ = try await provider(editor: { editor }, agent: { agent }).fetchSnapshot()
+            XCTFail("expected needsAuth")
+        } catch {
+            guard case UsageProviderError.needsAuth = error else { return XCTFail("got \(error)") }
+        }
+        XCTAssertEqual(CursorEndpoint.cookies.count, 2)
+    }
+
+    /// A server error on the editor's session is not a sign-out: report it,
+    /// don't paper over it with a different account's reading.
+    func testAServerErrorDoesNotSwitchToTheAgent() async {
+        CursorEndpoint.answers = [.init(status: 500)]
+        let editor = self.editor
+        do {
+            _ = try await provider(editor: { editor },
+                                   agent: { XCTFail("agent read"); throw UsageProviderError.needsAuth })
+                .fetchSnapshot()
+            XCTFail("expected badResponse")
+        } catch {
+            guard case UsageProviderError.badResponse(status: 500) = error else { return XCTFail("got \(error)") }
+        }
+    }
+
+    /// An expired agent JWT keeps the last reading rather than signing out.
+    func testAnExpiredAgentTokenIsNotASignOut() async {
+        CursorEndpoint.answers = [.init(status: 401)]
+        let editor = self.editor
+        do {
+            _ = try await provider(editor: { editor }, agent: { throw UsageProviderError.credentialExpired })
+                .fetchSnapshot()
+            XCTFail("expected credentialExpired")
+        } catch {
+            guard case UsageProviderError.credentialExpired = error else { return XCTFail("got \(error)") }
+        }
+    }
+}
+
+/// Answers `/api/usage-summary` from a queue and records the cookie each call sent.
+private final class CursorEndpoint: URLProtocol {
+    struct Answer {
+        let status: Int
+        var body: Data = Data()
+    }
+
+    private static let lock = NSLock()
+    static var answers: [Answer] = []
+    private(set) static var cookies: [String] = []
+
+    static func reset() {
+        lock.lock(); defer { lock.unlock() }
+        answers = []; cookies = []
+    }
+
+    static func session() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CursorEndpoint.self]
+        return URLSession(configuration: configuration)
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.lock.lock()
+        Self.cookies.append(request.value(forHTTPHeaderField: "Cookie") ?? "")
+        let answer = Self.answers.isEmpty ? Answer(status: 500) : Self.answers.removeFirst()
+        Self.lock.unlock()
+
+        let response = HTTPURLResponse(url: request.url!, statusCode: answer.status,
+                                       httpVersion: "HTTP/1.1", headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: answer.body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
