@@ -17,9 +17,21 @@ actor CursorLocalProvider: UsageProvider {
 
     private let endpoint = URL(string: "https://cursor.com/api/usage-summary")!
     private let session: URLSession
+    private let editorCredentials: @Sendable () throws -> CursorCredentials
+    private let agentCredentials: @Sendable () throws -> CursorCredentials
 
-    init(session: URLSession = .shared) {
+    /// The two loaders are injected so tests can stand in for the editor store
+    /// and the keychain; production reads both for real.
+    init(session: URLSession = .shared,
+         editorCredentials: @escaping @Sendable () throws -> CursorCredentials = {
+             try CursorCredentials.load(from: CursorCredentials.storeURL)
+         },
+         agentCredentials: @escaping @Sendable () throws -> CursorCredentials = {
+             try CursorCredentials.loadAgent()
+         }) {
         self.session = session
+        self.editorCredentials = editorCredentials
+        self.agentCredentials = agentCredentials
     }
 
     nonisolated var signInRoute: SignInRoute {
@@ -40,30 +52,28 @@ actor CursorLocalProvider: UsageProvider {
         // Re-read every time: the editor rotates this, and holding a stale copy
         // would mean signing ourselves out for no reason. The agent token is
         // cached inside `CursorAgentKeychain` so the keychain is not.
-        let credentials = try CursorCredentials.load()
-
-        var request = URLRequest(url: endpoint)
-        request.setValue(credentials.sessionCookie, forHTTPHeaderField: "Cookie")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.timeoutInterval = 15
-
-        let (data, response) = try await session.data(for: request)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-
-        if status == 401 || status == 403 {
-            // A rejected token is the one signal the copy in hand is wrong
-            // despite not having expired — signing into a different CLI
-            // account replaces the keychain item. Drop it so the next read
-            // asks macOS again.
-            CursorCredentials.forgetCachedAgent()
-            throw UsageProviderError.needsAuth
+        //
+        // Editor first, agent second — and the agent is reached not only when
+        // the editor store is missing or signed out, but also when the web
+        // endpoint *rejects* the editor's token. Recent Cursor builds keep an
+        // access token in `state.vscdb` that `/api/usage-summary` answers with
+        // 401, so a signed-in editor hid Cursor from the notch while signing
+        // it out (which drops that token) brought it back via `cursor-agent`.
+        let body: String
+        do {
+            body = try await usageSummary(with: try editorCredentials())
+        } catch UsageProviderError.needsAuth {
+            do {
+                body = try await usageSummary(with: try agentCredentials())
+            } catch UsageProviderError.needsAuth {
+                // A rejected token is the one signal the copy in hand is wrong
+                // despite not having expired — signing into a different CLI
+                // account replaces the keychain item. Drop it so the next read
+                // asks macOS again.
+                CursorCredentials.forgetCachedAgent()
+                throw UsageProviderError.needsAuth
+            }
         }
-        guard (200..<300).contains(status) else {
-            throw UsageProviderError.badResponse(status: status)
-        }
-
-        let body = String(data: data, encoding: .utf8) ?? ""
-        Log.usage.debug("cursor usage -> \(body.prefix(900), privacy: .public)")
 
         let windows = try CursorUsage.windows(fromJSON: body)
         return ProviderSnapshot(
@@ -76,5 +86,28 @@ actor CursorLocalProvider: UsageProvider {
             headlineID: CursorUsage.headlineID(in: windows),
             plan: CursorUsage.plan(fromJSON: body) ?? account()?.plan?.nonEmptyPlan
         )
+    }
+
+    /// One call to `/api/usage-summary`. 401/403 is `needsAuth` so the caller
+    /// can move on to the next session; anything else non-2xx is an error.
+    private func usageSummary(with credentials: CursorCredentials) async throws -> String {
+        var request = URLRequest(url: endpoint)
+        request.setValue(credentials.sessionCookie, forHTTPHeaderField: "Cookie")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 15
+
+        let (data, response) = try await session.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+
+        if status == 401 || status == 403 {
+            throw UsageProviderError.needsAuth
+        }
+        guard (200..<300).contains(status) else {
+            throw UsageProviderError.badResponse(status: status)
+        }
+
+        let body = String(data: data, encoding: .utf8) ?? ""
+        Log.usage.debug("cursor usage -> \(body.prefix(900), privacy: .public)")
+        return body
     }
 }

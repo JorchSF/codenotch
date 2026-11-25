@@ -1330,6 +1330,14 @@ final class AppPresenceTests: XCTestCase {
         XCTAssertEqual(AppPresence.hidden.activationPolicy, .accessory)
     }
 
+    /// The app launches as an agent so no Dock tile flashes up before the
+    /// stored choice is applied; the Dock option promotes it afterwards.
+    func testTheAppLaunchesWithoutADockTile() throws {
+        let plist = try XCTUnwrap(Bundle(for: AppDelegate.self).infoDictionary)
+        XCTAssertEqual(plist["CFBundleIdentifier"] as? String, "com.vinz.codenotch")
+        XCTAssertEqual(plist["LSUIElement"] as? Bool, true)
+    }
+
     /// What separates the two accessory modes.
     func testOnlyTheMenuBarOptionMakesAStatusItem() {
         XCTAssertFalse(AppPresence.dock.wantsStatusItem)

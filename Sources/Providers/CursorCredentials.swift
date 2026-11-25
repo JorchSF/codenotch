@@ -83,9 +83,13 @@ struct CursorCredentials {
         do {
             return try load(from: storeURL)
         } catch UsageProviderError.needsAuth {
-            return try session(fromAgentToken: try CursorAgentKeychain.load(),
-                               configURL: agentConfigURL)
+            return try loadAgent()
         }
+    }
+
+    /// The `cursor-agent` session alone: keychain JWT plus the CLI config.
+    static func loadAgent() throws -> CursorCredentials {
+        try session(fromAgentToken: try CursorAgentKeychain.load(), configURL: agentConfigURL)
     }
 
     /// Editor store only. Tests, and the combined loader above, pin the path

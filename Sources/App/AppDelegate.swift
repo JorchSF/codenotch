@@ -98,13 +98,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var manualProvider: ManualProvider?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Set here, not in the Info.plist: this call is applied at launch and
-        // overrides `LSUIElement` either way. Removing the plist key alone left
-        // the app registered as a UIElement with no Dock tile, which looked
-        // exactly like the icon having failed to install. The user's choice
-        // replaces this a moment later, once preferences exist.
-        NSApp.setActivationPolicy(.regular)
-        guard !isRunningTests else { return }
+        // The Info.plist launches as an agent (`LSUIElement`), and the policy is
+        // set from the stored choice as soon as preferences exist, below. Going
+        // `.regular` first — as this used to — put a Dock tile up for a moment
+        // even for someone who chose the menu bar or nothing.
+        guard !isRunningTests else {
+            NSApp.setActivationPolicy(.regular)
+            return
+        }
         Self.retireOlderInstances()
         ChannelNotifications.installPresenter()
 
@@ -113,6 +114,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Preferences.migrateFromPreviousName()
         let preferences = Preferences()
         self.preferences = preferences
+        // Applied explicitly rather than left to the plist: this call overrides
+        // `LSUIElement` either way, so the Dock default still gets its tile.
+        NSApp.setActivationPolicy(preferences.appPresence.activationPolicy)
 
         // One notch per display: the fleet owns a controller for each screen
         // the scope asks for and fans every reading out to all of them. The
